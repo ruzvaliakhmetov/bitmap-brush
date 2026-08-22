@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>plugin</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.ruzvaliakhmetov.BitmapBrush</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Bitmap Brush</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.2</string>
+	<key>CFBundleVersion</key>
+	<string>5</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright 2026 Ruz Valiakhmetov</string>
+	<key>NSPrincipalClass</key>
+	<string>BitmapBrush</string>
+	<key>PyMainFileNames</key>
+	<array>
+		<string>plugin.py</string>
+	</array>
+	<key>PyRuntimeLocations</key>
+	<array>
+		<string>@executable_path/../Frameworks/Python.framework/Versions/3.13/Python</string>
+		<string>@executable_path/../Frameworks/Python.framework/Versions/3.12/Python</string>
+		<string>@executable_path/../Frameworks/Python.framework/Versions/3.11/Python</string>
+		<string>~/Library/Application Support/Glyphs 3/Repositories/GlyphsPythonPlugin/Python.framework/Versions/3.13/Python</string>
+		<string>~/Library/Application Support/Glyphs 3/Repositories/GlyphsPythonPlugin/Python.framework/Versions/3.12/Python</string>
+		<string>~/Library/Application Support/Glyphs 3/Repositories/GlyphsPythonPlugin/Python.framework/Versions/3.11/Python</string>
+		<string>/Library/Frameworks/Python.framework/Versions/3.13/Python</string>
+		<string>/Library/Frameworks/Python.framework/Versions/3.12/Python</string>
+		<string>/Library/Frameworks/Python.framework/Versions/3.11/Python</string>
+		<string>/Library/Frameworks/Python.framework/Versions/3.10/Python</string>
+	</array>
+</dict>
+</plist>

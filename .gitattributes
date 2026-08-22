@@ -1,0 +1,21 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Binary files
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.otf  binary
+*.ttf  binary
+*.zip  binary
+*.tar.gz binary
+
+# Adobe design files
+*.ai  binary
+*.ait binary
+*.eps binary
+*.psd binary
+*.psb binary
