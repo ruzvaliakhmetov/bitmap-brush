@@ -167,6 +167,7 @@ class BitmapBrush(SelectTool):
     """Paint a 1-pixel-per-font-unit bitmap directly in Glyphs Edit View."""
 
     BITMAP_FOLDER = "bitmaps"
+    BRUSH_CONFIG_FILENAME = "brush.cfg"
     BITMAP_ALPHA = 100
 
     DEFAULT_ANGLE = 0.0
@@ -208,7 +209,9 @@ class BitmapBrush(SelectTool):
         self.name = Glyphs.localize({"en": "Bitmap Brush"})
 
         resourcesPath = os.path.dirname(self.__file__())
-        iconPath = os.path.join(resourcesPath, "toolbarIconTemplate.png")
+        iconPath = os.path.join(resourcesPath, "toolbarIconTemplate.pdf")
+        if not os.path.isfile(iconPath):
+            iconPath = os.path.join(resourcesPath, "toolbarIconTemplate.png")
         self._icon = NSImage.alloc().initByReferencingFile_(iconPath)
         try:
             self._icon.setTemplate_(True)
@@ -235,6 +238,7 @@ class BitmapBrush(SelectTool):
 
         self.cursorLocation = None
         self.cursorLayer = None
+        self.currentMasterConfigPath = None
 
         self.window = None
         self.previewView = None
@@ -307,6 +311,7 @@ class BitmapBrush(SelectTool):
                 self.buildPalette()
             else:
                 self.retargetPaletteControls()
+            self.syncBrushSettingsForCurrentLayerIfNeeded(force=True)
             self.syncPaletteControls()
             if self.window is not None:
                 self.window.orderFrontRegardless()
@@ -329,6 +334,7 @@ class BitmapBrush(SelectTool):
             self.temporarySelectMode = False
             self.cursorLocation = None
             self.cursorLayer = None
+            self.currentMasterConfigPath = None
             if BitmapBrush._activePaletteOwner is self:
                 BitmapBrush._activePaletteOwner = None
             try:
@@ -418,6 +424,7 @@ class BitmapBrush(SelectTool):
     def clearCursorPreview(self):
         self.cursorLocation = None
         self.cursorLayer = None
+        self.currentMasterConfigPath = None
 
     @objc.python_method
     def updateCursorLocation(self, event, redraw=True):
@@ -540,6 +547,7 @@ class BitmapBrush(SelectTool):
     # ------------------------------------------------------------------
 
     def mouseMoved_(self, event):
+        self.syncBrushSettingsForCurrentLayerIfNeeded()
         wasSelect = self.isSelectModifierDown()
         selectModifierDown = self.updateModifierState(event)
         if selectModifierDown:
@@ -554,6 +562,7 @@ class BitmapBrush(SelectTool):
 
     def mouseDown_(self, event):
         try:
+            self.syncBrushSettingsForCurrentLayerIfNeeded()
             selectModifierDown = self.updateModifierState(event)
             if selectModifierDown:
                 if self.painting:
@@ -640,7 +649,21 @@ class BitmapBrush(SelectTool):
             pass
 
     @objc.python_method
-    def setBrushParameters(self, angle=None, roundness=None, size=None, gray=None):
+    def persistBrushSettings(self):
+        self.saveBrushPreferences()
+        try:
+            font = Glyphs.font
+            fontPath = self.fontFilePath(font)
+            layer = self.activeLayer()
+            configPath = self.configPathForLayer(fontPath, font, layer)
+            if configPath:
+                self.writeBrushConfig(configPath)
+                self.currentMasterConfigPath = configPath
+        except Exception:
+            pass
+
+    @objc.python_method
+    def setBrushParameters(self, angle=None, roundness=None, size=None, gray=None, persist=True, requestRedraw=True):
         newAngle = self.brushAngle if angle is None else float(angle)
         newRoundness = self.brushRoundness if roundness is None else float(roundness)
         newSize = self.brushSize if size is None else int(round(float(size)))
@@ -667,8 +690,8 @@ class BitmapBrush(SelectTool):
 
         if geometryChanged:
             self.rebuildBrushGeometry()
-        if changed:
-            self.saveBrushPreferences()
+        if changed and persist:
+            self.persistBrushSettings()
 
         self.syncPaletteControls()
         try:
@@ -676,11 +699,122 @@ class BitmapBrush(SelectTool):
                 self.previewView.setNeedsDisplay_(True)
         except Exception:
             pass
-        if changed:
+        if changed and requestRedraw:
             try:
                 Glyphs.redraw()
             except Exception:
                 pass
+
+    @objc.python_method
+    def defaultBrushSettingsDict(self):
+        return {
+            "angle": int(round(self.DEFAULT_ANGLE)),
+            "roundness": int(round(self.DEFAULT_ROUNDNESS)),
+            "size": int(self.DEFAULT_SIZE),
+            "gray": int(self.DEFAULT_GRAY),
+        }
+
+    @objc.python_method
+    def brushSettingsDict(self):
+        return {
+            "angle": int(round(self.brushAngle)),
+            "roundness": int(round(self.brushRoundness)),
+            "size": int(self.brushSize),
+            "gray": int(self.brushGray),
+        }
+
+    @objc.python_method
+    def masterFolderPathForLayer(self, fontPath, font, layer):
+        if not fontPath:
+            return None
+        root = os.path.dirname(fontPath)
+        folder = os.path.join(root, self.BITMAP_FOLDER)
+        masterFolder = self.masterFolderNameForLayer(font, layer)
+        if not masterFolder:
+            return None
+        return os.path.join(folder, masterFolder)
+
+    @objc.python_method
+    def configPathForLayer(self, fontPath, font, layer):
+        masterFolderPath = self.masterFolderPathForLayer(fontPath, font, layer)
+        if not masterFolderPath:
+            return None
+        return os.path.join(masterFolderPath, self.BRUSH_CONFIG_FILENAME)
+
+    @objc.python_method
+    def writeBrushConfig(self, configPath, values=None):
+        directory = os.path.dirname(configPath)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        data = self.brushSettingsDict() if values is None else dict(values)
+        lines = [
+            "angle=%d" % data["angle"],
+            "roundness=%d" % data["roundness"],
+            "size=%d" % data["size"],
+            "gray=%d" % data["gray"],
+            "",
+        ]
+        tmpPath = configPath + ".tmp"
+        with open(tmpPath, "w") as handle:
+            handle.write("\n".join(lines))
+        os.replace(tmpPath, configPath)
+
+    @objc.python_method
+    def loadBrushConfig(self, configPath):
+        values = {
+            "angle": self.DEFAULT_ANGLE,
+            "roundness": self.DEFAULT_ROUNDNESS,
+            "size": self.DEFAULT_SIZE,
+            "gray": self.DEFAULT_GRAY,
+        }
+        if not configPath or not os.path.isfile(configPath):
+            return values
+        try:
+            with open(configPath, "r") as handle:
+                for rawLine in handle:
+                    line = rawLine.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+                    if key in values:
+                        values[key] = float(value)
+        except Exception:
+            pass
+        return values
+
+    @objc.python_method
+    def syncBrushSettingsForCurrentLayerIfNeeded(self, force=False):
+        font = Glyphs.font
+        layer = self.activeLayer()
+        fontPath = self.fontFilePath(font) if font is not None else None
+        configPath = self.configPathForLayer(fontPath, font, layer)
+        if not configPath:
+            return
+        if (
+            not force
+            and self.currentMasterConfigPath
+            and self.samePath(self.currentMasterConfigPath, configPath)
+        ):
+            return
+
+        if not os.path.isfile(configPath):
+            try:
+                self.writeBrushConfig(configPath, self.defaultBrushSettingsDict())
+            except Exception:
+                pass
+
+        values = self.loadBrushConfig(configPath)
+        self.currentMasterConfigPath = configPath
+        self.setBrushParameters(
+            angle=values.get("angle", self.DEFAULT_ANGLE),
+            roundness=values.get("roundness", self.DEFAULT_ROUNDNESS),
+            size=values.get("size", self.DEFAULT_SIZE),
+            gray=values.get("gray", self.DEFAULT_GRAY),
+            persist=False,
+            requestRedraw=False,
+        )
 
     @objc.python_method
     def adoptSharedPalette(self):
@@ -1019,7 +1153,7 @@ class BitmapBrush(SelectTool):
             Glyphs.showNotification("Bitmap Brush", "The active layer has no named glyph.")
             return
 
-        bitmapPath = self.bitmapPathForGlyph(fontPath, glyph.name)
+        bitmapPath = self.bitmapPathForGlyph(fontPath, glyph.name, layer, font)
         if not self.canUseLayerBackgroundImage(layer, bitmapPath, fontPath):
             Glyphs.showNotification(
                 "Bitmap Brush",
@@ -1366,6 +1500,7 @@ class BitmapBrush(SelectTool):
     @objc.python_method
     def foreground(self, layer):
         try:
+            self.syncBrushSettingsForCurrentLayerIfNeeded()
             # Live stroke delta: merged horizontal runs, so the draw cost is
             # proportional to run count rather than individual pixels.
             if self.painting and layer is self.paintingLayer and self.strokeRows:
@@ -1720,14 +1855,83 @@ class BitmapBrush(SelectTool):
         return None
 
     @objc.python_method
-    def bitmapPathForGlyph(self, fontPath, glyphName):
+    def bitmapPathForGlyph(self, fontPath, glyphName, layer=None, font=None):
         root = os.path.dirname(fontPath)
+        folder = os.path.join(root, self.BITMAP_FOLDER)
+        masterFolder = self.masterFolderNameForLayer(font, layer)
+        if masterFolder:
+            folder = os.path.join(folder, masterFolder)
+
         # Glyph names normally make safe filenames. Protect only actual path
         # separators while otherwise preserving the glyph name verbatim.
         safeName = str(glyphName).replace(os.sep, "_")
         if os.altsep:
             safeName = safeName.replace(os.altsep, "_")
-        return os.path.join(root, self.BITMAP_FOLDER, safeName + ".png")
+        return os.path.join(folder, safeName + ".png")
+
+    @objc.python_method
+    def masterFolderNameForLayer(self, font, layer):
+        if layer is None:
+            return None
+
+        master = None
+        try:
+            master = layer.master
+        except Exception:
+            master = None
+
+        if master is None:
+            masterId = None
+            for attr in ("associatedMasterId", "masterId"):
+                try:
+                    masterId = getattr(layer, attr)
+                    if callable(masterId):
+                        masterId = masterId()
+                    if masterId:
+                        break
+                except Exception:
+                    masterId = None
+            if masterId and font is not None:
+                try:
+                    master = font.fontMasterForId_(masterId)
+                except Exception:
+                    master = None
+                if master is None:
+                    try:
+                        for candidate in font.masters:
+                            if getattr(candidate, "id", None) == masterId:
+                                master = candidate
+                                break
+                    except Exception:
+                        pass
+
+        masterName = None
+        if master is not None:
+            try:
+                masterName = master.name
+            except Exception:
+                masterName = None
+
+        if not masterName:
+            try:
+                masterName = layer.name
+            except Exception:
+                masterName = None
+
+        if not masterName:
+            return None
+        return self.safePathComponent(masterName)
+
+    @objc.python_method
+    def safePathComponent(self, value):
+        safe = str(value).strip()
+        if not safe:
+            return "Master"
+        for separator in (os.sep, os.altsep):
+            if separator:
+                safe = safe.replace(separator, "_")
+        safe = safe.replace(":", "_")
+        return safe
 
     @objc.python_method
     def canUseLayerBackgroundImage(self, layer, targetPath, fontPath):
