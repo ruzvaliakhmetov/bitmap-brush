@@ -29,7 +29,7 @@ If the current layer already contains a different background image, *Bitmap Brus
 
 ## Current version
 
-`v0.2.4`
+`v0.2.6`
 
 ## License
 

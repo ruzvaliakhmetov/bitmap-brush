@@ -5,6 +5,7 @@ import math
 import objc
 import os
 import traceback
+import uuid
 
 from GlyphsApp import Glyphs, GSBackgroundImage
 from GlyphsApp.plugins import SelectTool
@@ -235,6 +236,8 @@ class BitmapBrush(SelectTool):
         self.strokeRows = {}
         self.strokeBounds = None
         self.lastLayer = None
+        self.strokeUndoState = None
+        self._bitmapUndoStates = {}
 
         self.cursorLocation = None
         self.cursorLayer = None
@@ -1168,6 +1171,11 @@ class BitmapBrush(SelectTool):
         if erasing and self.existingBitmapInfo(layer, bitmapPath) is None:
             return
 
+        # Capture the complete bitmap state before the stroke. The PNG lives
+        # outside the .glyphs document, so Glyphs' native undo manager cannot
+        # restore it by itself. We register one custom undo action on mouseUp.
+        self.strokeUndoState = self.captureBitmapUndoState(layer, bitmapPath)
+
         self.painting = True
         self.strokeErasing = bool(erasing)
         self.paintingLayer = layer
@@ -1208,6 +1216,7 @@ class BitmapBrush(SelectTool):
                 self.strokeRows = {}
                 self.strokeBounds = None
                 self.lastLayer = None
+                self.strokeUndoState = None
                 raise
 
     @objc.python_method
@@ -1224,6 +1233,11 @@ class BitmapBrush(SelectTool):
             if commit and layer is not None and bitmapPath and rows:
                 self.writeStrokeToPNG(layer, bitmapPath, rows)
                 self.attachFreshBackgroundImages(bitmapPath, layer, font)
+
+            if commit and layer is not None and bitmapPath and self.strokeUndoState is not None:
+                afterState = self.captureBitmapUndoState(layer, bitmapPath)
+                if not self.bitmapUndoStatesEqual(self.strokeUndoState, afterState):
+                    self.registerBitmapUndoState(self.strokeUndoState)
         except Exception:
             print(traceback.format_exc())
             Glyphs.showMacroWindow()
@@ -1242,6 +1256,7 @@ class BitmapBrush(SelectTool):
             self.strokeRows = {}
             self.strokeBounds = None
             self.lastLayer = None
+            self.strokeUndoState = None
             try:
                 Glyphs.redraw()
             except Exception:
@@ -1520,6 +1535,217 @@ class BitmapBrush(SelectTool):
             print(traceback.format_exc())
 
     # ------------------------------------------------------------------
+    # Bitmap Undo / Redo
+    # ------------------------------------------------------------------
+
+    @objc.python_method
+    def currentUndoManager(self, layer=None):
+        # GSLayer mutations are registered with the undo manager of the
+        # containing glyph, not necessarily the document/window manager.
+        # Disabling the document manager therefore did not suppress the native
+        # backgroundImage undo entry. Prefer the layer/glyph manager whenever
+        # a layer is known.
+        if layer is not None:
+            try:
+                manager = layer.undoManager
+                if callable(manager):
+                    manager = manager()
+                if manager is not None:
+                    return manager
+            except Exception:
+                pass
+            try:
+                glyph = getattr(layer, "parent", None)
+                if glyph is not None:
+                    manager = glyph.undoManager
+                    if callable(manager):
+                        manager = manager()
+                    if manager is not None:
+                        return manager
+            except Exception:
+                pass
+
+        try:
+            document = Glyphs.currentDocument
+            if callable(document):
+                document = document()
+            if document is not None:
+                manager = document.undoManager
+                if callable(manager):
+                    manager = manager()
+                if manager is not None:
+                    return manager
+        except Exception:
+            pass
+        return None
+
+    @objc.python_method
+    def disableUndoRegistration(self, manager):
+        if manager is None:
+            return False
+        try:
+            enabled = manager.isUndoRegistrationEnabled()
+        except Exception:
+            enabled = True
+        if not enabled:
+            return False
+        try:
+            manager.disableUndoRegistration()
+            return True
+        except Exception:
+            return False
+
+    @objc.python_method
+    def restoreUndoRegistration(self, manager, wasDisabled):
+        if manager is None or not wasDisabled:
+            return
+        try:
+            manager.enableUndoRegistration()
+        except Exception:
+            pass
+
+    @objc.python_method
+    def captureBitmapUndoState(self, layer, path):
+        exists = bool(path and os.path.isfile(path))
+        data = None
+        if exists:
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+            except Exception:
+                data = None
+
+        attached = False
+        origin = None
+        try:
+            bg = getattr(layer, "backgroundImage", None)
+            if bg is not None:
+                font = Glyphs.font
+                fontPath = self.fontFilePath(font) if font is not None else None
+                existingPath = self.absoluteBackgroundPath(bg, fontPath)
+                if existingPath and self.samePath(existingPath, path):
+                    attached = True
+                    origin = (
+                        int(round(float(bg.position.x))),
+                        int(round(float(bg.position.y))),
+                    )
+        except Exception:
+            pass
+
+        return {
+            "layer": layer,
+            "path": path,
+            "exists": exists,
+            "data": data,
+            "attached": attached,
+            "origin": origin,
+        }
+
+    @objc.python_method
+    def bitmapUndoStatesEqual(self, a, b):
+        if a is None or b is None:
+            return a is b
+        return (
+            bool(a.get("exists")) == bool(b.get("exists"))
+            and a.get("data") == b.get("data")
+            and bool(a.get("attached")) == bool(b.get("attached"))
+            and a.get("origin") == b.get("origin")
+        )
+
+    @objc.python_method
+    def registerBitmapUndoState(self, state):
+        if state is None:
+            return False
+        manager = self.currentUndoManager(state.get("layer"))
+        if manager is None:
+            return False
+
+        token = str(uuid.uuid4())
+        self._bitmapUndoStates[token] = state
+        try:
+            proxy = manager.prepareWithInvocationTarget_(self)
+            proxy.restoreBitmapUndoToken_(token)
+            try:
+                manager.setActionName_("Bitmap Brush Stroke")
+            except Exception:
+                pass
+            return True
+        except Exception:
+            self._bitmapUndoStates.pop(token, None)
+            return False
+
+    def restoreBitmapUndoToken_(self, token):
+        # This method is intentionally exposed to Objective-C: NSUndoManager
+        # invokes it for both Undo and Redo. Registering the current state while
+        # an undo is in progress automatically creates the corresponding redo.
+        tokenString = str(token)
+        state = self._bitmapUndoStates.pop(tokenString, None)
+        if state is None:
+            return
+
+        layer = state.get("layer")
+        path = state.get("path")
+        if layer is None or not path:
+            return
+
+        currentState = self.captureBitmapUndoState(layer, path)
+        self.registerBitmapUndoState(currentState)
+        self.applyBitmapUndoState(state)
+
+    @objc.python_method
+    def applyBitmapUndoState(self, state):
+        layer = state.get("layer")
+        path = state.get("path")
+        if layer is None or not path:
+            return
+
+        if state.get("exists") and state.get("data") is not None:
+            directory = os.path.dirname(path)
+            if directory and not os.path.isdir(directory):
+                os.makedirs(directory)
+            tempPath = path + ".undo.tmp"
+            with open(tempPath, "wb") as handle:
+                handle.write(state.get("data"))
+            os.replace(tempPath, path)
+        else:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        manager = self.currentUndoManager(layer)
+        undoWasDisabled = self.disableUndoRegistration(manager)
+        try:
+            if state.get("exists") and state.get("attached"):
+                origin = state.get("origin") or (0, 0)
+                fresh = GSBackgroundImage(path)
+                fresh.position = NSMakePoint(float(origin[0]), float(origin[1]))
+                fresh.scale = (1.0, 1.0)
+                fresh.rotation = 0.0
+                fresh.locked = True
+                try:
+                    fresh.alpha = self.BITMAP_ALPHA
+                except Exception:
+                    pass
+                layer.backgroundImage = fresh
+            else:
+                bg = getattr(layer, "backgroundImage", None)
+                if bg is not None:
+                    font = Glyphs.font
+                    fontPath = self.fontFilePath(font) if font is not None else None
+                    existingPath = self.absoluteBackgroundPath(bg, fontPath)
+                    if existingPath and self.samePath(existingPath, path):
+                        layer.backgroundImage = None
+        finally:
+            self.restoreUndoRegistration(manager, undoWasDisabled)
+
+        try:
+            Glyphs.redraw()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # PNG persistence and GSBackgroundImage refresh
     # ------------------------------------------------------------------
 
@@ -1773,17 +1999,22 @@ class BitmapBrush(SelectTool):
             except Exception:
                 pass
 
-        for candidate in layers:
-            fresh = GSBackgroundImage(path)
-            fresh.position = NSMakePoint(float(origin[0]), float(origin[1]))
-            fresh.scale = (1.0, 1.0)
-            fresh.rotation = 0.0
-            fresh.locked = True
-            try:
-                fresh.alpha = self.BITMAP_ALPHA
-            except Exception:
-                pass
-            candidate.backgroundImage = fresh
+        undoManager = self.currentUndoManager(activeLayer)
+        undoWasDisabled = self.disableUndoRegistration(undoManager)
+        try:
+            for candidate in layers:
+                fresh = GSBackgroundImage(path)
+                fresh.position = NSMakePoint(float(origin[0]), float(origin[1]))
+                fresh.scale = (1.0, 1.0)
+                fresh.rotation = 0.0
+                fresh.locked = True
+                try:
+                    fresh.alpha = self.BITMAP_ALPHA
+                except Exception:
+                    pass
+                candidate.backgroundImage = fresh
+        finally:
+            self.restoreUndoRegistration(undoManager, undoWasDisabled)
 
         try:
             del self._lastWrittenOrigin
