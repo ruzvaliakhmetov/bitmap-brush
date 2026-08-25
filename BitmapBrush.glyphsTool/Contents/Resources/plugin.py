@@ -18,6 +18,7 @@ from AppKit import (
     NSBitmapImageRep,
     NSColor,
     NSCursor,
+    NSEvent,
     NSFont,
     NSGraphicsContext,
     NSImage,
@@ -170,6 +171,7 @@ class BitmapBrush(SelectTool):
     BITMAP_FOLDER = "bitmaps"
     BRUSH_CONFIG_FILENAME = "brush.cfg"
     BITMAP_ALPHA = 100
+    PAINT_REDRAW_INTERVAL = 1.0 / 60.0
 
     DEFAULT_ANGLE = 0.0
     DEFAULT_ROUNDNESS = 100.0
@@ -233,6 +235,7 @@ class BitmapBrush(SelectTool):
         self.paintingFont = None
         self.bitmapPath = None
         self.lastBrushCenter = None
+        self._lastPaintRedrawTimestamp = 0.0
         self.strokeRows = {}
         self.strokeBounds = None
         self.lastLayer = None
@@ -242,6 +245,8 @@ class BitmapBrush(SelectTool):
         self.cursorLocation = None
         self.cursorLayer = None
         self.currentMasterConfigPath = None
+        self._previousMouseCoalescingEnabled = None
+        self._lastPaintRedrawTimestamp = 0.0
 
         self.window = None
         self.previewView = None
@@ -307,6 +312,7 @@ class BitmapBrush(SelectTool):
         self.commandKeyDown = False
         self.temporarySelectMode = False
         BitmapBrush._activePaletteOwner = self
+        self.enableHighFidelityMouseTracking()
 
         try:
             self.adoptSharedPalette()
@@ -338,6 +344,7 @@ class BitmapBrush(SelectTool):
             self.cursorLocation = None
             self.cursorLayer = None
             self.currentMasterConfigPath = None
+            self.restoreMouseCoalescing()
             if BitmapBrush._activePaletteOwner is self:
                 BitmapBrush._activePaletteOwner = None
             try:
@@ -349,6 +356,66 @@ class BitmapBrush(SelectTool):
                 NSCursor.arrowCursor().set()
             except Exception:
                 pass
+            try:
+                Glyphs.redraw()
+            except Exception:
+                pass
+
+    @objc.python_method
+    def enableHighFidelityMouseTracking(self):
+        """Disable AppKit mouse-event coalescing while the brush is active.
+
+        Fast pointer motion otherwise arrives as sparse drag samples and a
+        curved gesture becomes a sequence of straight Bresenham chords.
+        """
+        try:
+            if self._previousMouseCoalescingEnabled is None:
+                try:
+                    self._previousMouseCoalescingEnabled = bool(
+                        NSEvent.isMouseCoalescingEnabled()
+                    )
+                except Exception:
+                    self._previousMouseCoalescingEnabled = True
+            NSEvent.setMouseCoalescingEnabled_(False)
+        except Exception:
+            # Older AppKit/PyObjC builds may not expose the setter. The brush
+            # still works; it simply falls back to normal coalesced events.
+            pass
+
+    @objc.python_method
+    def restoreMouseCoalescing(self):
+        previous = self._previousMouseCoalescingEnabled
+        self._previousMouseCoalescingEnabled = None
+        if previous is None:
+            return
+        try:
+            NSEvent.setMouseCoalescingEnabled_(bool(previous))
+        except Exception:
+            pass
+
+    @objc.python_method
+    def requestPaintRedraw(self, event=None, force=False):
+        """Keep input sampling high-rate while limiting expensive redraws."""
+        timestamp = None
+        if event is not None:
+            try:
+                timestamp = float(event.timestamp())
+            except Exception:
+                timestamp = None
+
+        if timestamp is None:
+            try:
+                import time
+                timestamp = time.monotonic()
+            except Exception:
+                timestamp = self._lastPaintRedrawTimestamp + self.PAINT_REDRAW_INTERVAL
+
+        if (
+            force
+            or self._lastPaintRedrawTimestamp <= 0.0
+            or timestamp - self._lastPaintRedrawTimestamp >= self.PAINT_REDRAW_INTERVAL
+        ):
+            self._lastPaintRedrawTimestamp = timestamp
             try:
                 Glyphs.redraw()
             except Exception:
@@ -1183,6 +1250,7 @@ class BitmapBrush(SelectTool):
         self.paintingFont = font
         self.bitmapPath = bitmapPath
         self.lastBrushCenter = None
+        self._lastPaintRedrawTimestamp = 0.0
         self.strokeRows = {}
         self.strokeBounds = None
         self.lastLayer = layer
@@ -1284,17 +1352,15 @@ class BitmapBrush(SelectTool):
         previous = self.lastBrushCenter
 
         if previous is None:
-            centers = [center]
+            self.stampBrush(center[0], center[1])
         elif previous == center:
             return
         else:
-            centers = self.pixelLine(previous, center)
-
-        for cx, cy in centers:
-            self.stampBrush(cx, cy)
+            for cx, cy in self.pixelLine(previous, center):
+                self.stampBrush(cx, cy)
 
         self.lastBrushCenter = center
-        Glyphs.redraw()
+        self.requestPaintRedraw(event)
 
     @objc.python_method
     def rebuildBrushGeometry(self):
@@ -1428,10 +1494,9 @@ class BitmapBrush(SelectTool):
 
     @objc.python_method
     def pixelLine(self, start, end):
-        """Integer Bresenham centres, excluding start and including end."""
+        """Yield Bresenham centres, excluding start and including end."""
         x0, y0 = int(start[0]), int(start[1])
         x1, y1 = int(end[0]), int(end[1])
-        points = []
 
         dx = abs(x1 - x0)
         sx = 1 if x0 < x1 else -1
@@ -1447,8 +1512,7 @@ class BitmapBrush(SelectTool):
             if e2 <= dx:
                 err += dx
                 y0 += sy
-            points.append((x0, y0))
-        return points
+            yield (x0, y0)
 
     @objc.python_method
     def stampBrush(self, cx, cy):
@@ -1479,6 +1543,21 @@ class BitmapBrush(SelectTool):
 
         newLeft = int(left)
         newRight = int(right)
+
+        # A continuous brush stroke usually has one merged run per row. This
+        # avoids rebuilding a list for every pixel-centre stamp in that common
+        # case, which matters much more after disabling mouse coalescing.
+        if len(intervals) == 1:
+            oldLeft, oldRight = intervals[0]
+            if newRight + 1 < oldLeft:
+                intervals.insert(0, [newLeft, newRight])
+                return
+            if newLeft > oldRight + 1:
+                intervals.append([newLeft, newRight])
+                return
+            intervals[0][0] = min(oldLeft, newLeft)
+            intervals[0][1] = max(oldRight, newRight)
+            return
         merged = []
         inserted = False
 
