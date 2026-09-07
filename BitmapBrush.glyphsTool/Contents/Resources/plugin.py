@@ -193,6 +193,12 @@ class BitmapBrush(SelectTool):
 
     windowAutosaveName = "com.ruzvaliakhmetov.BitmapBrush.palette.window"
 
+    # Glyphs can instantiate Python tools more than once. Only the instance
+    # that most recently received willActivate() may draw, react to mouse/key
+    # events, show the palette, or touch bitmap/config files. This prevents a
+    # stale Bitmap Brush instance from leaking into another custom tool.
+    _activeInstance = None
+
     # Glyphs may instantiate a Python tool more than once. Keep one shared
     # floating palette and retarget it to whichever tool instance is active.
     _sharedWindow = None
@@ -215,12 +221,16 @@ class BitmapBrush(SelectTool):
         iconPath = os.path.join(resourcesPath, "toolbarIconTemplate.pdf")
         if not os.path.isfile(iconPath):
             iconPath = os.path.join(resourcesPath, "toolbarIconTemplate.png")
-        self._icon = NSImage.alloc().initByReferencingFile_(iconPath)
+        toolbarImage = NSImage.alloc().initByReferencingFile_(iconPath)
         try:
-            self._icon.setTemplate_(True)
+            toolbarImage.setTemplate_(True)
         except Exception:
             pass
-        self.tool_bar_image = self._icon
+        self.tool_bar_image = toolbarImage
+        # Glyphs' SelectTool wrapper treats self._icon as a resource *name*.
+        # Passing an NSImage there makes its icon setup call os.path.splitext()
+        # on an image object. We already supplied tool_bar_image directly.
+        self._icon = None
 
         self.bitmapBrushCursor = self.makeBitmapBrushCursor()
         self.optionKeyDown = False
@@ -305,8 +315,50 @@ class BitmapBrush(SelectTool):
         self.brushOutlinePath = None
         self.rebuildBrushGeometry()
 
+    # ------------------------------------------------------------------
+    # Tool lifecycle
+    # ------------------------------------------------------------------
+
+    def willActivate(self):
+        """Glyphs callback: this exact Bitmap Brush instance became active."""
+        previous = BitmapBrush._activeInstance
+        if previous is not None and previous is not self:
+            try:
+                previous._deactivateLocalState()
+            except Exception:
+                pass
+
+        BitmapBrush._activeInstance = self
+        try:
+            # Call Glyphs/GSToolSelect lifecycle code. Because this class no
+            # longer exposes activate(), SelectTool will not call our local
+            # activation twice.
+            objc.super(BitmapBrush, self).willActivate()
+        except Exception:
+            print(traceback.format_exc())
+
+        self._activateLocalState()
+
+    def willDeactivate(self):
+        """Glyphs callback: stop consuming events before another tool runs."""
+        try:
+            self._deactivateLocalState()
+        finally:
+            if BitmapBrush._activeInstance is self:
+                BitmapBrush._activeInstance = None
+            try:
+                # Same reasoning as willActivate(): SelectTool has no
+                # deactivate() hook to call now, so cleanup happens once.
+                objc.super(BitmapBrush, self).willDeactivate()
+            except Exception:
+                print(traceback.format_exc())
+
     @objc.python_method
-    def activate(self):
+    def isActiveInstance(self):
+        return bool(self.toolActive and BitmapBrush._activeInstance is self)
+
+    @objc.python_method
+    def _activateLocalState(self):
         self.toolActive = True
         self.optionKeyDown = False
         self.commandKeyDown = False
@@ -332,7 +384,7 @@ class BitmapBrush(SelectTool):
         Glyphs.redraw()
 
     @objc.python_method
-    def deactivate(self):
+    def _deactivateLocalState(self):
         try:
             if self.painting:
                 self.finishStroke(commit=True)
@@ -536,7 +588,7 @@ class BitmapBrush(SelectTool):
     @objc.python_method
     def drawBrushCursorPreview(self, layer):
         if (
-            not self.toolActive
+            not self.isActiveInstance()
             or self.isSelectModifierDown()
             or self.temporarySelectMode
             or self.cursorLocation is None
@@ -598,6 +650,8 @@ class BitmapBrush(SelectTool):
         return None
 
     def flagsChanged_(self, event):
+        if not self.isActiveInstance():
+            return None
         try:
             wasSelect = self.isSelectModifierDown()
             wasOption = bool(self.optionKeyDown)
@@ -617,6 +671,8 @@ class BitmapBrush(SelectTool):
     # ------------------------------------------------------------------
 
     def mouseMoved_(self, event):
+        if not self.isActiveInstance():
+            return None
         self.syncBrushSettingsForCurrentLayerIfNeeded()
         wasSelect = self.isSelectModifierDown()
         selectModifierDown = self.updateModifierState(event)
@@ -631,6 +687,8 @@ class BitmapBrush(SelectTool):
         self.updateCursorLocation(event)
 
     def mouseDown_(self, event):
+        if not self.isActiveInstance():
+            return None
         try:
             self.syncBrushSettingsForCurrentLayerIfNeeded()
             selectModifierDown = self.updateModifierState(event)
@@ -651,6 +709,8 @@ class BitmapBrush(SelectTool):
             Glyphs.showMacroWindow()
 
     def mouseDragged_(self, event):
+        if not self.isActiveInstance():
+            return None
         # Selection-tool pass-through stays intentionally tiny: no palette work,
         # no brush rebuilding, and no bitmap I/O in this hot path.
         if self.temporarySelectMode:
@@ -669,6 +729,8 @@ class BitmapBrush(SelectTool):
             Glyphs.showMacroWindow()
 
     def mouseUp_(self, event):
+        if not self.isActiveInstance():
+            return None
         try:
             if self.temporarySelectMode:
                 try:
@@ -1131,36 +1193,52 @@ class BitmapBrush(SelectTool):
             return float(fallback)
 
     def angleSlider_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(angle=sender.doubleValue())
 
     def roundnessSlider_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(roundness=sender.doubleValue())
 
     def sizeSlider_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(size=sender.doubleValue())
 
     def graySlider_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(gray=sender.doubleValue())
 
     def angleField_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(
             angle=self.numberFromField(sender, self.brushAngle)
         )
         self.refocusEditView()
 
     def roundnessField_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(
             roundness=self.numberFromField(sender, self.brushRoundness)
         )
         self.refocusEditView()
 
     def sizeField_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(
             size=self.numberFromField(sender, self.brushSize)
         )
         self.refocusEditView()
 
     def grayField_(self, sender):
+        if not self.isActiveInstance():
+            return None
         self.setBrushParameters(
             gray=self.numberFromField(sender, self.brushGray)
         )
@@ -1593,6 +1671,8 @@ class BitmapBrush(SelectTool):
 
     @objc.python_method
     def foreground(self, layer):
+        if not self.isActiveInstance():
+            return
         try:
             self.syncBrushSettingsForCurrentLayerIfNeeded()
             # Live stroke delta: merged horizontal runs, so the draw cost is
